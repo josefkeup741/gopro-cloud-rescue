@@ -10,6 +10,10 @@ This utility bypasses the broken web interface. It extracts your complete media 
 
 ## How to Use It (No Coding Required)
 
+[![GoPro Rescue Tutorial](https://img.youtube.com/vi/ALVnahS_QCU/0.jpg)](https://www.youtube.com/watch?v=ALVnahS_QCU)
+
+**[Watch the Step-by-Step Video Tutorial on YouTube](https://youtu.be/ALVnahS_QCU)**
+
 ### Step 1: Get Your `.har` File (The Magic Key)
 
 To bypass the broken download button, we need to capture the hidden IDs for your videos while the webpage loads.
