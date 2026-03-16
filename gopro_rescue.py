@@ -73,6 +73,10 @@ def process_pipeline(all_ids, batch_size=5):
             
             try:
                 # 1. DOWNLOAD
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
+                with requests.get(url, headers=headers, stream=True) as response:
                 with requests.get(url, stream=True) as response:
                     response.raise_for_status() 
                     total_size = int(response.headers.get('content-length', 0))
