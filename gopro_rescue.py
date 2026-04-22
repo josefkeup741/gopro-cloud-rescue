@@ -1,4 +1,5 @@
 import re
+import json
 import requests
 import os
 import zipfile
@@ -9,6 +10,75 @@ from tqdm import tqdm
 COMPLETED_LOG = "completed_ids.txt"
 OUTPUT_FOLDER = "GoPro_Library_Recovered"
 TEMP_ZIP = "gopro_temp_batch.zip"
+COOKIE_FILE = "gopro_cookie.txt"
+
+
+def load_cookie_file(path=None):
+    """First non-empty, non-# line from path (default COOKIE_FILE); full Cookie header value. None if missing/empty."""
+    path = path or COOKIE_FILE
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                return line
+    except OSError:
+        return None
+    return None
+
+
+def extract_browser_headers(har_filename):
+    """Headers from the first successful GET to api.gopro.com in the HAR (replay for zip download).
+
+    GoPro's zip endpoint expects a browser-like request; session cookies are often required.
+    Returns (headers_dict, has_cookie).
+    """
+    skip_lower = {
+        ":authority", ":method", ":path", ":scheme",
+        "content-length", "accept-encoding",
+        "if-none-match", "if-modified-since", "if-match", "if-unmodified-since",
+    }
+    try:
+        with open(har_filename, "r", encoding="utf-8", errors="ignore") as f:
+            har = json.load(f)
+    except (OSError, json.JSONDecodeError, KeyError):
+        return {}, False
+
+    entries = har.get("log", {}).get("entries", [])
+    for entry in entries:
+        req = entry.get("request") or {}
+        url = req.get("url") or ""
+        if "api.gopro.com" not in url or req.get("method") != "GET":
+            continue
+        if (entry.get("response") or {}).get("status") != 200:
+            continue
+
+        out = {}
+        for h in req.get("headers") or []:
+            name, value = h.get("name", ""), h.get("value", "")
+            low = name.lower()
+            if name.startswith(":") or low in skip_lower or low == "accept":
+                continue
+            if low == "cookie":
+                out["Cookie"] = value
+            else:
+                out[name] = value
+
+        cookie_parts = []
+        for c in req.get("cookies") or []:
+            n, v = c.get("name"), c.get("value", "")
+            if n:
+                cookie_parts.append(f"{n}={v}")
+        if cookie_parts and "Cookie" not in out:
+            out["Cookie"] = "; ".join(cookie_parts)
+
+        return out, bool(out.get("Cookie"))
+
+    return {}, False
+
 
 def extract_ids(har_filename):
     print(f"\n--- STEP 1: Scanning {har_filename} ---")
@@ -42,8 +112,21 @@ def log_completed_ids(batch_ids):
     with open(COMPLETED_LOG, 'a') as f:
         f.write(",".join(batch_ids) + ",")
 
-def process_pipeline(all_ids, batch_size=5):
+def process_pipeline(all_ids, har_filename, batch_size=5):
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    base_headers, _har_has_cookie = extract_browser_headers(har_filename)
+    file_cookie = load_cookie_file()
+    if file_cookie:
+        base_headers["Cookie"] = file_cookie
+    has_cookie = bool(base_headers.get("Cookie"))
+    if not has_cookie:
+        print(
+            "\n⚠️  No session cookie found. Put your DevTools `Cookie` header value in "
+            f"'{COOKIE_FILE}' (first non-empty line), or export a HAR that includes credentials for api.gopro.com.\n"
+            "    HAR in Chrome: DevTools → Network → preserve log → reload while logged in → right‑click → "
+            '"Save all as HAR with content".'
+        )
     
     # Check the ledger and filter out videos we already have
     completed_ids = get_completed_ids()
@@ -72,12 +155,16 @@ def process_pipeline(all_ids, batch_size=5):
             print(f"\n📥 Processing Batch {i + 1} of {len(pending_batches)} (Contains {len(batch)} files)...")
             
             try:
-                # 1. DOWNLOAD
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                }
+                # 1. DOWNLOAD (reuse browser context from HAR; zip API rejects bare User-Agent-only requests)
+                headers = dict(base_headers)
+                headers.setdefault(
+                    "User-Agent",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                )
+                headers.setdefault("Origin", "https://gopro.com")
+                headers.setdefault("Referer", "https://gopro.com/")
+                headers["Accept"] = "*/*"
                 with requests.get(url, headers=headers, stream=True) as response:
-                with requests.get(url, stream=True) as response:
                     response.raise_for_status() 
                     total_size = int(response.headers.get('content-length', 0))
                     
@@ -110,6 +197,21 @@ def process_pipeline(all_ids, batch_size=5):
                 log_completed_ids(batch)
                 print(f"✅ Batch securely extracted and logged to ledger.")
                 
+            except requests.HTTPError as e:
+                resp = e.response
+                if resp is not None and resp.status_code == 403:
+                    print(
+                        f"❌ Error during processing: {e}\n"
+                        "   (403 Forbidden: session is missing or expired. Refresh "
+                        f"'{COOKIE_FILE}' with a new Cookie from DevTools (while logged in at gopro.com), "
+                        "or capture a fresh HAR that includes credentials, then run this script again.)"
+                    )
+                else:
+                    print(f"❌ Error during processing: {e}")
+                if os.path.exists(TEMP_ZIP):
+                    os.remove(TEMP_ZIP)
+                failed_batches.append(batch)
+                time.sleep(2)
             except Exception as e:
                 print(f"❌ Error during processing: {e}")
                 if os.path.exists(TEMP_ZIP):
@@ -141,7 +243,7 @@ if __name__ == "__main__":
     if ids:
         proceed = input("\nReady to start downloading? (y/n): ").strip().lower()
         if proceed == 'y':
-            process_pipeline(ids)
+            process_pipeline(ids, har_input)
         else:
             print("Download cancelled.")
             

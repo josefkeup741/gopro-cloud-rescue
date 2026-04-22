@@ -35,6 +35,8 @@ To bypass the broken download button, we need to capture the hidden IDs for your
 
 ## For Developers (Running the Source Code)
 
+Since the GoPro HAR file does not store the cookie, you can copy the cookie out of any one of the Network request headers from your browser. Just copy the contents of the cookie into a file in the root named `gopro_cookie.txt`.
+
 If you prefer to run the raw Python script yourself instead of the compiled `.exe`:
 
 1. Clone this repository.
@@ -43,7 +45,8 @@ If you prefer to run the raw Python script yourself instead of the compiled `.ex
    pip install requests tqdm
    ```
 3. Place your `gopro.com.har` file in the root directory.
-4. Run the script:
+4. Place your `gopro_cookie.txt` file in the root directory.
+5. Run the script:
    ```bash
    python gopro_rescue.py
    ```
