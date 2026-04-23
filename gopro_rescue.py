@@ -80,6 +80,48 @@ def extract_browser_headers(har_filename):
     return {}, False
 
 
+def extract_id_filename_map(har_filename):
+    """Build {media_id: filename} from api.gopro.com/media/search response bodies in the HAR.
+
+    Falls back to content_title if filename is missing. Returns {} on any parse failure.
+    """
+    mapping = {}
+    try:
+        with open(har_filename, "r", encoding="utf-8", errors="ignore") as f:
+            har = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return mapping
+
+    for entry in har.get("log", {}).get("entries", []):
+        url = (entry.get("request") or {}).get("url", "")
+        if "api.gopro.com/media/search" not in url:
+            continue
+        text = ((entry.get("response") or {}).get("content") or {}).get("text")
+        if not text:
+            continue
+        try:
+            obj = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        stack = [obj]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                fid = cur.get("id")
+                name = cur.get("filename") or cur.get("content_title")
+                if isinstance(fid, str) and isinstance(name, str) and fid and name:
+                    mapping.setdefault(fid, name)
+                for v in cur.values():
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(cur, list):
+                for v in cur:
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+    return mapping
+
+
 def extract_ids(har_filename):
     print(f"\n--- STEP 1: Scanning {har_filename} ---")
     try:
@@ -115,6 +157,7 @@ def log_completed_ids(batch_ids):
 def process_pipeline(all_ids, har_filename, batch_size=5):
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+    id_to_name = extract_id_filename_map(har_filename)
     base_headers, _har_has_cookie = extract_browser_headers(har_filename)
     file_cookie = load_cookie_file()
     if file_cookie:
@@ -152,7 +195,9 @@ def process_pipeline(all_ids, har_filename, batch_size=5):
             batch_str = ",".join(batch)
             url = f"https://api.gopro.com/media/x/zip/source?ids={batch_str}"
             
+            labels = [id_to_name.get(vid, vid) for vid in batch]
             print(f"\n📥 Processing Batch {i + 1} of {len(pending_batches)} (Contains {len(batch)} files)...")
+            print(f"   Files in batch: {', '.join(labels)}")
             
             try:
                 # 1. DOWNLOAD (reuse browser context from HAR; zip API rejects bare User-Agent-only requests)
