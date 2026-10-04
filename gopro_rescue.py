@@ -9,6 +9,36 @@ from tqdm import tqdm
 COMPLETED_LOG = "completed_ids.txt"
 OUTPUT_FOLDER = "GoPro_Library_Recovered"
 TEMP_ZIP = "gopro_temp_batch.zip"
+TOKEN_FILE = "Cookie.txt"
+
+def load_auth_token():
+    """Reads the GoPro auth token from the AUTH_TOKEN env var, Cookie.txt, or a prompt."""
+    token = os.environ.get("AUTH_TOKEN", "").strip()
+    if not token and os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, 'r', encoding='utf-8', errors='ignore') as file:
+            content = file.read().strip()
+        # The file may hold the whole browser cookie string or just the token itself
+        match = re.search(r'gp_access_token=([^;\s]+)', content)
+        token = match.group(1) if match else content
+    if not token:
+        token = input("Paste your GoPro auth token (the value of the 'gp_access_token' cookie): ").strip()
+    return token
+
+def api_headers(auth_token):
+    return {
+        "Accept": "application/vnd.gopro.jk.media+json; version=2.0.0",
+        "Authorization": f"Bearer {auth_token}",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+def validate_auth_token(auth_token):
+    """Checks the token with GoPro up front, so an expired one fails before any download starts."""
+    response = requests.get("https://api.gopro.com/media/user", headers=api_headers(auth_token))
+    if response.status_code != 200:
+        print(f"❌ GoPro rejected your auth token (HTTP {response.status_code}). Log in to gopro.com again and copy a fresh 'gp_access_token'.")
+        return False
+    print("✅ Auth token accepted by GoPro.")
+    return True
 
 def extract_ids(har_filename):
     print(f"\n--- STEP 1: Scanning {har_filename} ---")
@@ -16,7 +46,8 @@ def extract_ids(har_filename):
         with open(har_filename, 'r', encoding='utf-8', errors='ignore') as file:
             content = file.read()
             
-        pattern = r'\\"id\\":\\"([a-zA-Z0-9]{13})\\"'
+        # Older media use 13-character IDs; media uploaded since late 2025 use 24-character hex IDs
+        pattern = r'\\"id\\":\\"([a-zA-Z0-9]{13}|[0-9a-f]{24})\\"'
         found_ids = list(set(re.findall(pattern, content)))
         
         if not found_ids:
@@ -28,6 +59,33 @@ def extract_ids(har_filename):
     except FileNotFoundError:
         print(f"❌ Error: Could not find '{har_filename}'. Make sure it's in the same folder as this script.")
         return None
+
+def fetch_ids_from_api(auth_token):
+    """Pages through your GoPro media library and returns every media ID, so no HAR file is needed."""
+    print("\n--- STEP 1: Fetching your media list from GoPro ---")
+    found_ids = []
+    page = 1
+    total_pages = 1
+
+    while page <= total_pages:
+        params = {"per_page": 100, "page": page, "fields": "id"}
+        response = requests.get("https://api.gopro.com/media/search", params=params, headers=api_headers(auth_token))
+        if response.status_code != 200:
+            print(f"❌ Failed to fetch page {page} of your media list (HTTP {response.status_code}).")
+            return None
+
+        content = response.json()
+        total_pages = content.get("_pages", {}).get("total_pages", 1)
+        found_ids.extend(item["id"] for item in content.get("_embedded", {}).get("media", []))
+        page += 1
+
+    found_ids = list(dict.fromkeys(found_ids))
+    if not found_ids:
+        print("❌ Your GoPro media library appears to be empty.")
+        return None
+
+    print(f"✅ Success! Found {len(found_ids)} unique video IDs.")
+    return found_ids
 
 def get_completed_ids():
     """Reads the ledger to see which videos have already been successfully extracted."""
@@ -42,7 +100,7 @@ def log_completed_ids(batch_ids):
     with open(COMPLETED_LOG, 'a') as f:
         f.write(",".join(batch_ids) + ",")
 
-def process_pipeline(all_ids, batch_size=5):
+def process_pipeline(all_ids, auth_token, batch_size=5):
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     
     # Check the ledger and filter out videos we already have
@@ -73,11 +131,7 @@ def process_pipeline(all_ids, batch_size=5):
             
             try:
                 # 1. DOWNLOAD
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                }
-                with requests.get(url, headers=headers, stream=True) as response:
-                with requests.get(url, stream=True) as response:
+                with requests.get(url, headers=api_headers(auth_token), stream=True) as response:
                     response.raise_for_status() 
                     total_size = int(response.headers.get('content-length', 0))
                     
@@ -132,16 +186,18 @@ if __name__ == "__main__":
     print("      GoPro Cloud Rescue Utility        ")
     print("========================================")
     
-    har_input = input("Enter the name of your HAR file (Press Enter for default 'gopro.com.har'): ").strip()
-    if har_input == "":
-        har_input = "gopro.com.har"
-        
-    ids = extract_ids(har_input)
+    auth_token = load_auth_token()
+    if not validate_auth_token(auth_token):
+        input("\nPress Enter to exit...")
+        raise SystemExit(1)
+
+    har_input = input("Enter the name of your HAR file (or press Enter to fetch your media list straight from GoPro): ").strip()
+    ids = extract_ids(har_input) if har_input else fetch_ids_from_api(auth_token)
     
     if ids:
         proceed = input("\nReady to start downloading? (y/n): ").strip().lower()
         if proceed == 'y':
-            process_pipeline(ids)
+            process_pipeline(ids, auth_token)
         else:
             print("Download cancelled.")
             
